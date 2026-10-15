@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # PimiPulse agent installer: enrol, upgrade or remove the agent on a Linux box with systemd.
 #
-# Needs Ubuntu 22.04+ or Debian 12+ (systemd, OpenSSL 3.0 for the signature check).
+# Needs systemd and OpenSSL 3.0 for the signature check (Ubuntu 22.04+ or Debian 12+).
 #
 #   Enrol:    curl -fsSL https://raw.githubusercontent.com/shazzad/pimipulse-releases/main/install.sh \
 #               | sudo bash -s -- --endpoint https://pulse.example.com --code pp_enr_...
@@ -62,6 +62,18 @@ CURRENT=""
 say() { printf '%s\n' "$*"; }
 die() { printf 'pimipulse-agent installer: %s\n' "$*" >&2; exit 1; }
 cleanup() { if [ -n "$WORK" ]; then rm -rf "$WORK"; fi; }
+
+# The install command for a package on this box, for hints: dnf (RHEL family, Amazon Linux 2023),
+# else yum, else apt-get.
+pkg_install() {
+  if command -v dnf >/dev/null 2>&1; then
+    printf 'dnf install %s' "$1"
+  elif command -v yum >/dev/null 2>&1; then
+    printf 'yum install %s' "$1"
+  else
+    printf 'apt-get install %s' "$1"
+  fi
+}
 
 unit_file() {
 cat <<'PIMIPULSE_UNIT'
@@ -280,10 +292,10 @@ fetch() { # url dest
 # openssl only (nothing downloaded is executed). Sets BIN_VERSION from the signed line.
 verify_signature() {
   local dir="$1" prefix="" keyid="" version="" sig="" extra="" want_id
-  command -v openssl >/dev/null 2>&1 || die "openssl is required to check the release signature (apt-get install openssl)."
+  command -v openssl >/dev/null 2>&1 || die "openssl is required to check the release signature ($(pkg_install openssl))."
   # Ed25519 over raw data needs pkeyutl -rawin, added in OpenSSL 3.0.
   openssl pkeyutl -help 2>&1 | grep -q -- '-rawin' \
-    || die "checking the release signature needs OpenSSL 3.0 or later (Ubuntu 22.04+, Debian 12+); this box has $(openssl version 2>/dev/null || echo an older one)."
+    || die "checking the release signature needs OpenSSL 3.0 or later (Ubuntu 22.04+, Debian 12+, RHEL/AlmaLinux/Rocky 9+, Amazon Linux 2023 ship it); this box has $(openssl version 2>/dev/null || echo an older one)."
   [ "$(wc -c <"$dir/SHA256SUMS.sig")" -le 1024 ] || die "SHA256SUMS.sig is too large; nothing was installed."
   [ "$(wc -c <"$dir/SHA256SUMS")" -le 16384 ] || die "SHA256SUMS is too large; nothing was installed."
   read -r prefix keyid version sig extra <"$dir/SHA256SUMS.sig" || true
@@ -328,7 +340,7 @@ download() {
   say "Signature OK for $BIN_VERSION. Downloading $asset and $helper_asset..."
   fetch "$base/$asset" "$WORK/$asset" || die "could not download $base/$asset."
   fetch "$base/$helper_asset" "$WORK/$helper_asset" || die "could not download $base/$helper_asset."
-  command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required to verify the download."
+  command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required to verify the download ($(pkg_install coreutils))."
   for f in "$asset" "$helper_asset"; do
     [ "$(grep -cE "^[0-9a-f]{64}[[:space:]]+\*?$f\$" "$WORK/SHA256SUMS")" = 1 ] \
       || die "SHA256SUMS has no single line for $f; nothing was installed."
@@ -373,6 +385,23 @@ do_uninstall() {
   say "pimipulse-agent removed: services, update units, both binaries and state. Remove the server in the PimiPulse app too if you no longer want it listed."
 }
 
+# uid_running UID: a process runs as UID (real, effective, saved or fs). Reads /proc directly: ps
+# (procps) is missing on minimal images (the AlmaLinux and Amazon Linux containers), where
+# `ps ... | grep` failed and so never found anything. Plain bash, no awk: mawk (Debian) stops at the
+# first status file of a process that exited meanwhile.
+uid_running() {
+  local f k r e s fs rest
+  for f in /proc/[0-9]*/status; do
+    while read -r k r e s fs rest; do
+      if [ "$k" = "Uid:" ]; then
+        case " $r $e $s $fs " in *" $1 "*) return 0 ;; esac
+        break
+      fi
+    done 2>/dev/null <"$f" || true
+  done
+  return 1
+}
+
 # Enrol under a one-off identity: a random uid above 4,000,000,000 that no account and no running
 # process has (checked), so no other process shares it (nobody is shared: another nobody process
 # could read the new key or swap the file). The agent generates the key and talks to the app in a
@@ -384,9 +413,9 @@ do_uninstall() {
 as_uid() { local u="$1"; shift; setpriv --reuid="$u" --regid="$u" --clear-groups --no-new-privs -- "$@"; }
 enrol() {
   local tmp owner uid dir
-  command -v setpriv >/dev/null 2>&1 || die "setpriv (util-linux) is required to enrol without running the agent as root."
+  command -v setpriv >/dev/null 2>&1 || die "setpriv is required to enrol without running the agent as root ($(pkg_install util-linux))."
   uid=$(( 4000000000 + (RANDOM * 32768 + RANDOM) % 290000000 )) # below 4294967295 (-1)
-  if getent passwd "$uid" >/dev/null 2>&1 || ps -e -o uid= | grep -qw "$uid"; then
+  if getent passwd "$uid" >/dev/null 2>&1 || uid_running "$uid"; then
     die "uid $uid is in use; run the installer again."
   fi
   chmod 0711 "$WORK"
