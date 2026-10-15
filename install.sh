@@ -468,7 +468,11 @@ do_install() {
   fi
   say "Installed: $BIN, $HELPER, $UNIT, $UPD_SERVICE, $UPD_PATH, $UPD_TIMER, $UPDATE_DIR; state in $STATE_DIR."
   say "Auto-update is on: the agent fetches signed releases itself and $HELPER installs them (it is updated only by this installer)."
-  say "Waiting for the agent's first report (about a minute)..."
+  if [ -n "$CODE" ]; then
+    say "Waiting for the agent's first report (a few seconds)..."
+  else
+    say "Waiting for the agent's first report (up to a minute)..."
+  fi
   wait_for_report "$started" \
     || die "the agent is running but has not reported yet; see journalctl -u pimipulse-agent, or run: sudo $BIN doctor"
 }
