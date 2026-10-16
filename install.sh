@@ -42,6 +42,7 @@ UPD_PATH=/etc/systemd/system/pimipulse-agent-update.path
 UPD_TIMER=/etc/systemd/system/pimipulse-agent-update.timer
 DROPIN_DIR=/etc/systemd/system/pimipulse-agent.service.d
 STATE_DIR=/var/lib/pimipulse
+PRIVATE_STATE_DIR=/var/lib/private/pimipulse
 UPDATE_DIR=/var/lib/pimipulse-update
 MIN_VERSION=0.4.0
 NOBODY=65534
@@ -418,6 +419,12 @@ enrol() {
   if getent passwd "$uid" >/dev/null 2>&1 || uid_running "$uid"; then
     die "uid $uid is in use; run the installer again."
   fi
+  # The layout first, so a box it refuses doesn't use up the code. Stopped first: an agent stuck
+  # restarting (238/STATE_DIRECTORY) would race the move.
+  if [ -d "$STATE_DIR" ] && [ ! -L "$STATE_DIR" ]; then
+    systemctl stop pimipulse-agent 2>/dev/null || true
+  fi
+  state_dir_layout
   chmod 0711 "$WORK"
   dir="$WORK/enrol-$RANDOM$RANDOM"
   install -d -m 0700 -o "$uid" -g "$uid" "$dir"
@@ -429,15 +436,42 @@ enrol() {
   [ -s "$tmp" ] || die "enrolment wrote no agent.json."
   rm -rf "$dir"
   chmod 0640 "$tmp"
-  if [ -d "$STATE_DIR" ]; then
-    owner="$(stat -L -c '%u:%g' "$STATE_DIR")"
-  else
-    install -d -m 0750 -o root -g root "$STATE_DIR"
-    owner="0:0"
-  fi
+  owner="$(stat -L -c '%u:%g' "$STATE_DIR")"
   chown "$owner" "$tmp"
   mv -fT "$tmp" "$STATE_DIR/agent.json"
   say "Enrolment saved to $STATE_DIR/agent.json."
+}
+
+# The agent's state directory in the layout systemd's DynamicUser= keeps it in: the real directory
+# at /var/lib/private/pimipulse and /var/lib/pimipulse a symlink to it. When systemd finds a plain
+# /var/lib/pimipulse it renames it there itself on the first start, and SELinux (AlmaLinux, Rocky,
+# RHEL, Amazon Linux) forbids systemd that rename ("avc: denied { rename } ... init_t ... var_lib_t"),
+# so the agent never started (status 238/STATE_DIRECTORY). Done here as root instead; it also moves a
+# plain directory left by an earlier install that hit that.
+state_dir_layout() {
+  [ -L "$STATE_DIR" ] && return 0
+  if [ ! -d /var/lib/private ]; then
+    install -d -m 0700 -o root -g root /var/lib/private
+  fi
+  if [ -d "$STATE_DIR" ]; then
+    [ ! -e "$PRIVATE_STATE_DIR" ] && [ ! -L "$PRIVATE_STATE_DIR" ] \
+      || die "both $STATE_DIR and $PRIVATE_STATE_DIR exist; move one aside and run again."
+    mv -T "$STATE_DIR" "$PRIVATE_STATE_DIR"
+  elif [ -e "$STATE_DIR" ]; then
+    die "$STATE_DIR is not a directory; move it aside and run again."
+  elif [ ! -d "$PRIVATE_STATE_DIR" ]; then
+    install -d -m 0750 -o root -g root "$PRIVATE_STATE_DIR"
+  fi
+  ln -sT private/pimipulse "$STATE_DIR"
+}
+
+# restore_labels PATH...: the SELinux policy's default labels (bin_t, systemd_unit_file_t) on what
+# was installed, when SELinux is on. `install` already creates each file with its directory's label;
+# this is the guard. Never fatal: a box without restorecon has no SELinux to satisfy.
+restore_labels() {
+  if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled && command -v restorecon >/dev/null 2>&1; then
+    restorecon -F "$@" || say "warning: restorecon failed on $*; if the agent does not start, run: restorecon -RF $*"
+  fi
 }
 
 # Wait for status.json to show a successful post after $1 (unix seconds). Read as data only.
@@ -471,8 +505,12 @@ do_install() {
   update_timer_file >"$WORK/upd.timer"
   install -m 0644 "$WORK/upd.timer" "$UPD_TIMER"
   install -d -m 0755 -o root -g root "$UPDATE_DIR"
+  restore_labels "$BIN" "$HELPER" "$UNIT" "$UPD_SERVICE" "$UPD_PATH" "$UPD_TIMER"
   if [ -n "$CODE" ]; then
     enrol
+  elif [ -d "$STATE_DIR" ] && [ ! -L "$STATE_DIR" ]; then
+    systemctl stop pimipulse-agent 2>/dev/null || true
+    state_dir_layout
   fi
   # Verified above; this is the root helper systemd runs as root anyway.
   "$HELPER" record-install "$BIN_VERSION" </dev/null || die "could not record the installed version in $UPDATE_DIR."
