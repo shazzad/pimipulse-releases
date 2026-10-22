@@ -91,7 +91,8 @@ Restart=always
 RestartSec=10
 Environment=PIMIPULSE_STATE_DIR=/var/lib/pimipulse
 
-# Read-only agent: it reads /proc, /sys, /etc, /run/systemd/units and /lib/systemd,
+# Read-only agent: it reads /proc, /sys, /etc, /run/systemd/units, /lib/systemd and
+# (PHP-FPM pool files, 0.8.0) /opt/remi and /opt/cpanel,
 # and writes only its state file in /var/lib/pimipulse (StateDirectory below).
 DynamicUser=yes
 NoNewPrivileges=yes
